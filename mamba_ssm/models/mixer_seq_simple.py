@@ -4,9 +4,14 @@ import math
 from functools import partial
 
 from collections import namedtuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+
+from torch.nn import CrossEntropyLoss
+
+from transformers import PretrainedConfig
 
 from mamba_ssm.modules.mamba_simple import Mamba, Block
 from mamba_ssm.utils.generation import GenerationMixin
@@ -206,6 +211,12 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             )
         )
         self.tie_weights()
+        self.config = PretrainedConfig(
+            d_model = d_model,
+            n_layer = n_layer,
+            vocab_size = vocab_size,
+            hidden_size = d_model,
+        )        
 
     def tie_weights(self):
         self.lm_head.weight = self.backbone.embedding.weight
@@ -213,7 +224,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0):
+    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, labels = None):
         """
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
         num_last_tokens: if > 0, only return the logits for the last n tokens
@@ -222,8 +233,211 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
-        CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
-        return CausalLMOutput(logits=lm_logits)
+        
+        loss = None
+        if labels is not None:
+            logits = lm_logits
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+            # print(loss, shift_logits, shift_logits.dtype, shift_labels, shift_labels.dtype)
+            return (loss,)
+            
+        else:
+            CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
+            return CausalLMOutput(logits=lm_logits)
+
+    # def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0):
+    #     """
+    #     "position_ids" is just to be compatible with Transformer generation. We don't use it.
+    #     num_last_tokens: if > 0, only return the logits for the last n tokens
+    #     """
+    #     hidden_states = self.backbone(input_ids, inference_params=inference_params)
+    #     if num_last_tokens > 0:
+    #         hidden_states = hidden_states[:, -num_last_tokens:]
+    #     lm_logits = self.lm_head(hidden_states)
+    #     CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
+    #     return CausalLMOutput(logits=lm_logits)
+
+    # https://github.com/huggingface/transformers/blob/514de24abfd4416aeba6a6455ad5920f57f3567d/src/transformers/modeling_utils.py#L1605
+    def _get_resized_embeddings(
+        self,
+        old_embeddings: nn.Embedding,
+        new_num_tokens: Optional[int] = None,
+        pad_to_multiple_of: Optional[int] = None,
+    ) -> nn.Embedding:
+
+        # if pad_to_multiple_of is not None:
+        #     if not isinstance(pad_to_multiple_of, int):
+        #         raise ValueError(
+        #             f"Asking to pad the embedding matrix to a multiple of `{pad_to_multiple_of}`, which is not and integer. Please make sure to pass an integer"
+        #         )
+        #     if new_num_tokens is None:
+        #         new_num_tokens = old_embeddings.weight.shape[0]
+        #     new_num_tokens = ((new_num_tokens + pad_to_multiple_of - 1) // pad_to_multiple_of) * pad_to_multiple_of
+        # else:
+        #     logger.info(
+        #         "You are resizing the embedding layer without providing a `pad_to_multiple_of` parameter. This means that the new embedding"
+        #         f" dimension will be {new_num_tokens}. This might induce some performance reduction as *Tensor Cores* will not be available."
+        #         " For more details about this, or help on choosing the correct value for resizing, refer to this guide:"
+        #         " https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#requirements-tc"
+        #     )
+
+        # if new_num_tokens is None:
+        #     return old_embeddings
+
+        # if is_deepspeed_zero3_enabled():
+        #     import deepspeed
+
+        #     with deepspeed.zero.GatheredParameters(old_embeddings.weight, modifier_rank=None):
+        #         old_num_tokens, old_embedding_dim = old_embeddings.weight.size()
+        # else:
+        old_num_tokens, old_embedding_dim = old_embeddings.weight.size()
+
+        # if old_num_tokens == new_num_tokens and not is_deepspeed_zero3_enabled():
+        #     return old_embeddings
+
+        if not isinstance(old_embeddings, nn.Embedding):
+            raise TypeError(
+                f"Old embeddings are of type {type(old_embeddings)}, which is not an instance of {nn.Embedding}. You"
+                " should either use a different resize function or make sure that `old_embeddings` are an instance of"
+                f" {nn.Embedding}."
+            )
+
+        # Build new embeddings
+
+        new_embeddings = nn.Embedding(
+            new_num_tokens,
+            old_embedding_dim,
+            device=old_embeddings.weight.device,
+            dtype=old_embeddings.weight.dtype,
+        )
+
+        # initialize all new embeddings (in particular added tokens)
+        # self._init_weights(new_embeddings)
+        nn.init.normal_(new_embeddings.weight, std=0.02)
+
+        # Copy token embeddings from the previous weights
+
+        # numbers of tokens to copy
+        n = min(old_num_tokens, new_num_tokens)
+
+        # if is_deepspeed_zero3_enabled():
+        #     import deepspeed
+
+        #     params = [old_embeddings.weight, new_embeddings.weight]
+        #     with deepspeed.zero.GatheredParameters(params, modifier_rank=0):
+        #         new_embeddings.weight.data[:n, :] = old_embeddings.weight.data[:n, :]
+        # else:
+        new_embeddings.weight.data[:n, :] = old_embeddings.weight.data[:n, :]
+
+        return new_embeddings
+
+
+    def resize_token_embeddings(
+        self, new_num_tokens: Optional[int] = None, pad_to_multiple_of: Optional[int] = None
+    ) -> nn.Embedding:
+        """
+        Resizes input token embeddings matrix of the model if `new_num_tokens != config.vocab_size`.
+
+        Takes care of tying weights embeddings afterwards if the model class has a `tie_weights()` method.
+
+        Arguments:
+            new_num_tokens (`int`, *optional*):
+                The number of new tokens in the embedding matrix. Increasing the size will add newly initialized
+                vectors at the end. Reducing the size will remove vectors from the end. If not provided or `None`, just
+                returns a pointer to the input tokens `torch.nn.Embedding` module of the model without doing anything.
+            pad_to_multiple_of (`int`, *optional*):
+                If set will pad the embedding matrix to a multiple of the provided value.If `new_num_tokens` is set to
+                `None` will just pad the embedding to a multiple of `pad_to_multiple_of`.
+
+                This is especially useful to enable the use of Tensor Cores on NVIDIA hardware with compute capability
+                `>= 7.5` (Volta), or on TPUs which benefit from having sequence lengths be a multiple of 128. For more
+                details about this, or help on choosing the correct value for resizing, refer to this guide:
+                https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#requirements-tc
+
+        Return:
+            `torch.nn.Embedding`: Pointer to the input tokens Embeddings Module of the model.
+        """
+        model_embeds = self._resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
+        # if new_num_tokens is None and pad_to_multiple_of is None:
+        #     return model_embeds
+
+        # Update base model and current model config
+        # self.config.vocab_size = model_embeds.weight.shape[0]
+        # self.vocab_size = model_embeds.weight.shape[0]
+
+        # Tie weights again if needed
+        self.tie_weights()
+
+        return model_embeds
+
+    def _resize_token_embeddings(self, new_num_tokens, pad_to_multiple_of=None):
+        old_embeddings = self.get_input_embeddings()
+        new_embeddings = self._get_resized_embeddings(old_embeddings, new_num_tokens, pad_to_multiple_of)
+        # if hasattr(old_embeddings, "_hf_hook"):
+        #     hook = old_embeddings._hf_hook
+        #     add_hook_to_module(new_embeddings, hook)
+        self.set_input_embeddings(new_embeddings)
+
+        # Update new_num_tokens with the actual size of new_embeddings
+        if pad_to_multiple_of is not None:
+            # if is_deepspeed_zero3_enabled():
+            #     import deepspeed
+
+            #     with deepspeed.zero.GatheredParameters(new_embeddings.weight, modifier_rank=None):
+            #         new_num_tokens = new_embeddings.weight.shape[0]
+            # else:
+            new_num_tokens = new_embeddings.weight.shape[0]
+
+        # if word embeddings are not tied, make sure that lm head is resized as well
+        # if self.get_output_embeddings() is not None and not self.config.tie_word_embeddings:
+        #     old_lm_head = self.get_output_embeddings()
+        #     new_lm_head = self._get_resized_lm_head(old_lm_head, new_num_tokens)
+        #     if hasattr(old_lm_head, "_hf_hook"):
+        #         hook = old_lm_head._hf_hook
+        #         add_hook_to_module(new_lm_head, hook)
+        #     self.set_output_embeddings(new_lm_head)
+
+        return self.get_input_embeddings()
+
+    # https://github.com/huggingface/transformers/blob/514de24abfd4416aeba6a6455ad5920f57f3567d/src/transformers/modeling_utils.py#L1343C9-L1343C29        
+    def get_input_embeddings(self) -> nn.Module:
+        """
+        Returns the model's input embeddings.
+
+        Returns:
+            `nn.Module`: A torch module mapping vocabulary to hidden states.
+        """
+        # base_model = getattr(self, self.base_model_prefix, self)
+        # if base_model is not self:
+        #     return base_model.get_input_embeddings()
+        # else:
+        #     raise NotImplementedError
+        return self.backbone.embedding
+
+    def set_input_embeddings(self, value: nn.Module):
+        """
+        Set model's input embeddings.
+
+        Args:
+            value (`nn.Module`): A module mapping vocabulary to hidden states.
+        """
+        # base_model = getattr(self, self.base_model_prefix, self)
+        # if base_model is not self:
+        #     base_model.set_input_embeddings(value)
+        # else:
+        #     raise NotImplementedError
+        # self.backbone.embedding.vocab_size = value.shape[0]
+        # self.backbone.embedding.weight = value
+        self.backbone.embedding = value
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):
